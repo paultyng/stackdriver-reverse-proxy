@@ -26,9 +26,12 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"time"
 
 	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/trace"
+
+	sproxy "github.com/GoogleCloudPlatform/stackdriver-reverse-proxy"
 )
 
 var (
@@ -39,6 +42,13 @@ var (
 	tlsCert   string
 	tlsKey    string
 	traceFrac float64
+
+	monitorHTTP   bool
+	monitorPeriod string
+
+	enableErrorReports bool
+
+	metricsReporter *sproxy.MetricsReporter
 )
 
 const usage = `stackdriver-reverse-proxy [opts...] -target=<host:port>
@@ -53,6 +63,8 @@ Options:
 
 Tracing options:
   -trace-fraction Tracing sampling fraction, between 0 and 1.0.
+  -monitor-http	  Turning on reporting HTTP stats to StackDriver Monitoring
+  -monitor-period The period at which StackDriver Monitoring reports are sent
 
 HTTPS options:
   -tls-cert TLS cert file to start an HTTPS proxy.
@@ -71,6 +83,8 @@ func main() {
 	flag.Float64Var(&traceFrac, "trace-fraction", 1, "sampling fraction for tracing")
 	flag.StringVar(&tlsCert, "tls-cert", "", "TLS cert file to start an HTTPS proxy")
 	flag.StringVar(&tlsKey, "tls-key", "", "TLS key file to start an HTTPS proxy")
+	flag.BoolVar(&monitorHTTP, "monitor-http", false, "send monitor reports to stackdriver Monitoring")
+	flag.StringVar(&monitorPeriod, "monitor-period", "1m", "the period for stackdriver Monitoring")
 	flag.Parse()
 
 	if target == "" {
@@ -95,6 +109,23 @@ func main() {
 		log.Fatalf("Cannot URL parse -target: %v", err)
 	}
 
+	if monitorHTTP {
+		period, err := time.ParseDuration(monitorPeriod)
+		if err != nil {
+			period = 1 * time.Minute
+		}
+		metricsReporter, err = sproxy.NewMetricsReporter(period)
+		if err != nil {
+			log.Fatalf("Cannot create the metricsReporter: %v", err)
+		}
+		metricsReporter.SetStatsReceiver(sendToStackDriverMonitoring)
+
+		// Fire up the metricsReporter
+		go metricsReporter.Do()
+		// Close it once we are done
+		defer metricsReporter.Close()
+	}
+
 	tc, err := trace.NewClient(ctx, projectID)
 	if err != nil {
 		log.Fatalf("Cannot initiate trace client: %v", err)
@@ -117,12 +148,43 @@ type transport struct {
 	Trace *trace.Client
 }
 
-func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (t *transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	s := t.Trace.SpanFromRequest(req)
 	defer s.Finish()
 
 	req.Header.Set("X-Cloud-Trace-Context", s.Header())
-	resp, err := http.DefaultTransport.RoundTrip(req)
+
+	if metricsReporter != nil {
+		startTime := time.Now()
+		traceID := s.TraceID()
+		go metricsReporter.AddEvent(&sproxy.Event{
+			Request:   true,
+			ID:        traceID,
+			StartTime: startTime,
+			EndTime:   startTime,
+		})
+
+		// At the end, once we have a response,
+		// capture its end metrics and fire off events
+		defer func() {
+			statusCode := 500
+			if resp != nil {
+				statusCode = resp.StatusCode
+			}
+
+			// Fire off in a goroutine so that RoundTrip isn't blocked
+			// at all
+			go metricsReporter.AddEvent(&sproxy.Event{
+				StartTime:  startTime,
+				EndTime:    time.Now(),
+				ID:         traceID,
+				StatusCode: statusCode,
+				Err:        err,
+			})
+		}()
+	}
+
+	resp, err = http.DefaultTransport.RoundTrip(req)
 	if err != nil {
 		s.SetLabel("error", err.Error())
 	}
@@ -132,4 +194,9 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 func usageExit() {
 	flag.Usage()
 	os.Exit(1)
+}
+
+func sendToStackDriverMonitoring(stats *sproxy.InflightStats) error {
+	// TODO (@odeke-em, @rakyll): Insert the code for StackDriverMonitoring here
+	return nil
 }
